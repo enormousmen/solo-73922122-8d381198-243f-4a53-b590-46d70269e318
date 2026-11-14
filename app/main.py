@@ -1,14 +1,17 @@
 """FastAPI 入口：上传、分页、合并、游标生命周期。"""
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import uuid
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from . import config, cursors, storage
+from .concurrency import pin_registry
 from .db import LOCK, get_conn, next_file_seq
 from .merger import MergeConflict, manager
 from .storage import ParquetValidationError
@@ -25,6 +28,11 @@ async def lifespan(_app: FastAPI):
     # 关停：等待后台合并线程退出
     for t in list(manager._threads.values()):  # noqa: SLF001
         t.join(timeout=5)
+    # 关停前等所有在途慢读释放 pin（最多几秒），避免与容器回收竞争
+    deadline = 5.0
+    while deadline > 0 and pin_registry.snapshot():
+        await asyncio.sleep(0.05)
+        deadline -= 0.05
 
 
 app = FastAPI(
@@ -54,6 +62,12 @@ def _conflict_handler(_request: Request, exc: MergeConflict):
 def _cursor_handler(_request: Request, exc: cursors.CursorError):
     # “已关闭/不存在”语义统一用 404
     return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(cursors.CursorReadError)
+def _cursor_read_handler(_request: Request, exc: cursors.CursorReadError):
+    # 读盘/完整性失败：明确 500，读取位置未推进，客户端可安全重试
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 
 @app.get("/health", tags=["meta"], summary="健康检查与启动恢复结果")
@@ -230,7 +244,8 @@ def resume_merge() -> dict:
     return manager.resume()
 
 
-@app.post("/merges/reclaim", tags=["merge"], summary="立即回收无游标引用的 obsolete 文件")
+@app.post("/merges/reclaim", tags=["merge"],
+          summary="立即回收无游标引用且无在读 pin 的 obsolete 文件")
 def reclaim_now() -> dict:
     return manager.reclaim()
 
@@ -255,3 +270,36 @@ def fail_inject(step: str) -> dict:
         )
         conn.commit()
     return {"fail_inject": step, "note": "将在下一次合并触发，触发后自动清除"}
+
+
+# --------------------------- 慢读交错验证 ---------------------------
+
+class SlowReadBody(BaseModel):
+    seconds: float = Field(
+        ..., ge=0.0, le=60.0, description="每次分页读盘前额外 sleep 的秒数，0 关闭慢读"
+    )
+
+
+@app.get(
+    "/debug/slow-read",
+    tags=["debug"],
+    summary="查看当前分页慢读延迟与在读 pin 快照（交错验证用）",
+)
+def get_slow_read() -> dict:
+    return {
+        "slow_read_seconds": storage.slow_read.seconds,
+        "pinned_files": [
+            {"file_pk": pk, "pin_count": count}
+            for pk, count in sorted(pin_registry.snapshot().items())
+        ],
+    }
+
+
+@app.post(
+    "/debug/slow-read",
+    tags=["debug"],
+    summary="动态设置分页慢读延迟（仅作用于分页读盘路径，交错验证用）",
+)
+def set_slow_read(body: SlowReadBody) -> dict:
+    applied = storage.slow_read.set(body.seconds)
+    return {"slow_read_seconds": applied}

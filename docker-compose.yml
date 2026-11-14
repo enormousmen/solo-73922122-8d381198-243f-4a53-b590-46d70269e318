@@ -10,6 +10,8 @@ services:
       MAX_UPLOAD_BYTES: "8388608"      # 8 MiB
       DEFAULT_PAGE_LIMIT: "1000"
       AUTO_MERGE_ON_START: "false"
+      # 分页慢读注入秒数（0=关闭）；运行期可用 POST /debug/slow-read 动态调整
+      SLOW_READ_SECONDS: "0"
     volumes:
       - lakehouse-data:/data
     # 不用 restart 策略，方便演示“切换/回收中退出后重启”的恢复流程

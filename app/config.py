@@ -18,4 +18,9 @@ AUTO_MERGE_ON_START = os.environ.get("AUTO_MERGE_ON_START", "false").lower() == 
 DEFAULT_PAGE_LIMIT = int(os.environ.get("DEFAULT_PAGE_LIMIT", "1000"))
 MAX_PAGE_LIMIT = int(os.environ.get("MAX_PAGE_LIMIT", "100000"))
 
+# 可控慢读：每次分页 Parquet 读盘前额外 sleep 的秒数（0=关闭）。
+# 仅用于验证“慢读期间上传/建游标/合并切换/关闭回收”等交错操作，
+# 运行期还可经 POST /debug/slow-read 动态调整。
+SLOW_READ_SECONDS = float(os.environ.get("SLOW_READ_SECONDS", "0"))
+
 CANONICAL_COLUMNS = ("station_id", "observed_at", "temperature")

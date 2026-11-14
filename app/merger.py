@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import pyarrow.parquet as pq
 
 from . import config, storage
+from .concurrency import pin_registry
 from .db import LOCK, get_conn, next_file_seq
 
 TERMINAL_STATES = ("completed", "failed", "cancelled")
@@ -326,13 +327,16 @@ class MergeManager:
     # ----------------------------- 回收 -----------------------------
 
     def reclaim(self) -> dict:
-        """删除没有任何未关闭游标引用的 obsolete 文件。
+        """删除没有任何未关闭游标引用、且当前没有在读 pin 的 obsolete 文件。
 
         active 文件永远不会被本函数触碰；obsolete 文件只要还被某个
-        closed=0 的游标快照引用，就保留在磁盘上。
+        closed=0 的游标快照引用，或正被某个慢读请求 pin（即使该游标
+        刚刚关闭、读盘尚未结束），就保留在磁盘上。本函数在调用方持有
+        ``db.LOCK`` 时运行，与分页读盘的 pin/unpin 互斥，不会与删除竞争。
         """
         conn = get_conn()
         removed: list[str] = []
+        skipped_pinned: list[str] = []
         with LOCK:
             candidates = conn.execute(
                 """SELECT f.id, f.file_id, f.path FROM files f
@@ -343,12 +347,16 @@ class MergeManager:
                        WHERE cf.file_id = f.id AND c.closed = 0)"""
             ).fetchall()
             for c in candidates:
+                # 慢读请求仍持有该文件的 pin：跳过，等其读完后再回收
+                if pin_registry.is_pinned(c["id"]):
+                    skipped_pinned.append(c["file_id"])
+                    continue
                 if os.path.exists(c["path"]):
                     os.remove(c["path"])
                     removed.append(c["file_id"])
                 conn.execute("DELETE FROM files WHERE id=?", (c["id"],))
             conn.commit()
-        return {"reclaimed": removed}
+        return {"reclaimed": removed, "skipped_pinned": skipped_pinned}
 
     # --------------------------- 崩溃恢复 ---------------------------
 

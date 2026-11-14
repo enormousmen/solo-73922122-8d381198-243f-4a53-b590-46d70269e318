@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 import uuid
 from typing import Iterator
 
@@ -11,6 +13,31 @@ import pyarrow.parquet as pq
 from . import config
 
 REQUIRED_COLUMNS = ("station_id", "observed_at", "temperature")
+
+
+class _SlowReadControl:
+    """分页慢读开关（仅作用于分页读盘路径）。
+
+    初始值来自环境变量 ``SLOW_READ_SECONDS``，运行期可由
+    ``POST /debug/slow-read`` 调整，用于确定性地制造慢读交错场景。
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self._lock = threading.Lock()
+        self._seconds = max(0.0, seconds)
+
+    @property
+    def seconds(self) -> float:
+        with self._lock:
+            return self._seconds
+
+    def set(self, seconds: float) -> float:
+        with self._lock:
+            self._seconds = max(0.0, float(seconds))
+            return self._seconds
+
+
+slow_read = _SlowReadControl(config.SLOW_READ_SECONDS)
 
 
 class ParquetValidationError(ValueError):
@@ -92,12 +119,17 @@ def validate_and_stage(data: bytes) -> tuple[pa.Table, int, str]:
 
 
 def read_rows(path: str, offset: int, limit: int) -> list[dict]:
-    """读取单个 parquet 文件 [offset, offset+limit) 的行，转成 JSON 友好字典。"""
+    """读取单个 parquet 文件 [offset, offset+limit) 的行，转成 JSON 友好字典。
+
+    注意：本函数是“慢读”所在路径，调用方不得持有进程全局元数据锁，
+    否则一次慢盘读取会拖住上传/建游标等所有操作。读盘前通过
+    ``slow_read`` 注入可配置的人为延迟，供交错场景验证使用。
+    """
+    delay = slow_read.seconds
+    if delay > 0:
+        time.sleep(delay)
     table = pq.read_table(path)
-    if offset:
-        table = table.slice(offset, limit)
-    else:
-        table = table.slice(0, limit)
+    table = table.slice(offset, limit)
     return table_to_rows(table)
 
 
